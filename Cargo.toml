@@ -1,0 +1,16 @@
+[package]
+name = "momentum-quant"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+sui-sdk-types = { git = "https://github.com/mystenlabs/sui-rust-sdk", features = ["serde"] }
+sui-rpc = { git = "https://github.com/mystenlabs/sui-rust-sdk", features = ["faucet"] }
+sui-crypto = { git = "https://github.com/mystenlabs/sui-rust-sdk", features = ["ed25519"] }
+sui-transaction-builder = { git = "https://github.com/mystenlabs/sui-rust-sdk" }
+tokio = { version = "1", features = ["full"] }
+anyhow = "1.0"
+rand = "0.8"
+bech32 = "0.9"
+hex = "0.4"
+prost-types = "0.14.1"
