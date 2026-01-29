@@ -3,6 +3,23 @@
 version = 4
 
 [[package]]
+name = "CDEsuiTrade"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bech32",
+ "futures",
+ "hex",
+ "prost-types",
+ "rand 0.8.5",
+ "sui-crypto",
+ "sui-rpc",
+ "sui-sdk-types",
+ "sui-transaction-builder",
+ "tokio",
+]
+
+[[package]]
 name = "anyhow"
 version = "1.0.100"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -804,22 +821,6 @@ dependencies = [
  "libc",
  "wasi",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "momentum-quant"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bech32",
- "hex",
- "prost-types",
- "rand 0.8.5",
- "sui-crypto",
- "sui-rpc",
- "sui-sdk-types",
- "sui-transaction-builder",
- "tokio",
 ]
 
 [[package]]

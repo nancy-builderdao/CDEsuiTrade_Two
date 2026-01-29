@@ -1,5 +1,5 @@
 [package]
-name = "momentum-quant"
+name = "CDEsuiTrade"
 version = "0.1.0"
 edition = "2024"
 
@@ -14,3 +14,4 @@ rand = "0.8"
 bech32 = "0.9"
 hex = "0.4"
 prost-types = "0.14.1"
+futures = "0.3"

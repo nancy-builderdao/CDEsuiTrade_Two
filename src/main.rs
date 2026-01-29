@@ -10,6 +10,9 @@ use sui_transaction_builder::unresolved::Input;
 use prost_types::FieldMask;
 use sui_rpc::proto::sui::rpc::v2::Object;
 use tokio::time::Instant;
+use sui_rpc::proto::sui::rpc::v2::SubscribeCheckpointsRequest;
+use futures::StreamExt;
+
 
 mod momentum;
 mod cetus;
@@ -19,7 +22,7 @@ mod bluefin;
 const DEBUG_MAIN: bool = true;
 
 /// Default swap amount (in smallest unit of the token).
-const DEFAULT_SWAP_AMOUNT: u64 = 1000;
+const DEFAULT_SWAP_AMOUNT: u64 = 1000000;
 
 /// Default gas budget and gas price.
 const DEFAULT_GAS_BUDGET: u64 = 500_000_00;
@@ -29,10 +32,10 @@ const DEFAULT_GAS_PRICE: u64 = 1_000;
 const DEFAULT_POOL_ID: &str =
     "0x455cf8d2ac91e7cb883f515874af750ed3cd18195c970b7a2d46235ac2b0c388";
 const DEFAULT_TOKEN_OBJECT_ID: &str =
-    "0x73f4a6e1b0cc88644de7017419a47e85ebbf1d4230f71d4c3c30cd2cd87bafaf";
+    "0x66bcedb93c0a58689944a5b8fb532e80c61300c8f8bf608f47d35dd0736c91b5";
 
 /// Example private key (bech32 suiprivkey format).
-const EXAMPLE_PRIVATE_KEY: &str = "input_yout_private_key";
+const EXAMPLE_PRIVATE_KEY: &str = "suiprivkey1qzcq4jx6g0a8jmpwer0wfpr5kc8r2mfrmklj2a7f72xft2ff36w2wmsvyf4";
 
 const VERSIONED_OBJECT_ID: &str =
     "0x2375a0b1ec12010aaea3b2545acfa2ad34cfbba03ce4b59f4c39e1e25eed1b2a";
@@ -43,7 +46,7 @@ const CETUS_GLOBAL_CONFIG_ID: &str =
 const CETUS_POOL_ID: &str =
     "0x51e883ba7c0b566a26cbc8a94cd33eb0abd418a77cc1e60ad22fd9b1f29cd2ab"; // Replace with actual pool id
 const CETUS_TOKEN_OBJECT_ID: &str =
-    "0x73f4a6e1b0cc88644de7017419a47e85ebbf1d4230f71d4c3c30cd2cd87bafaf"; // Replace with actual token object id
+    "0x66bcedb93c0a58689944a5b8fb532e80c61300c8f8bf608f47d35dd0736c91b5"; // Replace with actual token object id
 
 // Token types for Cetus
 const CETUS_TOKEN_A_TYPE: &str = "0x2::sui::SUI";
@@ -56,7 +59,7 @@ const BLUEFIN_GLOBAL_CONFIG_ID: &str =
 const BLUEFIN_POOL_ID: &str =
     "0x15dbcac854b1fc68fc9467dbd9ab34270447aabd8cc0e04a5864d95ccb86b74a";
 const BLUEFIN_TOKEN_OBJECT_ID: &str =
-    "0x73f4a6e1b0cc88644de7017419a47e85ebbf1d4230f71d4c3c30cd2cd87bafaf"; // Replace with actual token object id
+    "0x66bcedb93c0a58689944a5b8fb532e80c61300c8f8bf608f47d35dd0736c91b5"; // Replace with actual token object id
 
 // Token types for Bluefin
 const BLUEFIN_TOKEN_A_TYPE: &str = "0x2::sui::SUI";
@@ -71,16 +74,44 @@ enum SwapType {
     Bluefin,
 }
 
+// 搜尋這段並替換掉原本的 fn main
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    // Select which swap to execute.
-    let swap_type = SwapType::Cetus; // Change to SwapType::Cetus or SwapType::Bluefin
+    // 1. 建立兩個客戶端：一個負責監聽，一個負責發送 (避免借用衝突)
+    // 注意：這裡直接寫死 IP，省去解析時間
+    let mut monitor_client = Client::new("http://3.114.103.176:443")?;
+    let mut action_client = Client::new("http://3.114.103.176:443")?; 
+    
+    println!("🚀 gRPC 監控已啟動，等待最新 Checkpoint...");
 
-    match swap_type {
-        SwapType::Momentum => run_momentum_swap().await,
-        SwapType::Cetus => run_cetus_swap().await,
-        SwapType::Bluefin => run_bluefin_swap().await,
+    // 2. 建立 Checkpoint 訂閱流
+    let mut sub_client = monitor_client.subscription_client();
+    let stream = sub_client
+        .subscribe_checkpoints(SubscribeCheckpointsRequest::default())
+        .await?;
+    let mut stream = stream.into_inner();
+
+    // 3. 進入監聽迴圈
+    while let Some(item) = stream.next().await {
+        match item {
+            Ok(resp) => {
+                // 抓取觸發當下的 Checkpoint 序號
+                let cursor = resp.cursor.unwrap_or_default();
+                
+                // 4. 立即觸發交易 (傳入 action_client 和 cursor)
+                // 這裡我們直接呼叫修改後的 run_bluefin_swap
+                if let Err(e) = run_bluefin_swap(&mut action_client, cursor).await {
+                    eprintln!("❌ 交易執行失敗: {}", e);
+                }
+                
+                // 如果只想測試一次就停，可以把下面這行取消註解
+                break;
+            }
+            Err(e) => eprintln!("Stream error: {}", e),
+        }
     }
+
+    Ok(())
 }
 
 /// Run Momentum swap transaction.
@@ -351,7 +382,10 @@ async fn run_cetus_swap() -> Result<(), Box<dyn Error>> {
 }
 
 /// Run Bluefin swap transaction.
-async fn run_bluefin_swap() -> Result<(), Box<dyn Error>> {
+async fn run_bluefin_swap(
+    client: &mut Client, 
+    trigger_checkpoint: u64
+) -> Result<(), Box<dyn Error>> {
     debug_main("[run_bluefin_swap] start");
     let start = Instant::now();
 
@@ -364,12 +398,12 @@ async fn run_bluefin_swap() -> Result<(), Box<dyn Error>> {
     debug_main("[run_bluefin_swap] decoded private key and derived address");
 
     // 2. Create Sui gRPC client.
-    let mut client = Client::new("http://3.114.103.176:443")?;
+    //let mut client = Client::new("http://3.114.103.176:443")?;
     println!("Sui gRPC client connected");
     debug_main("[run_bluefin_swap] Sui gRPC client created");
 
     // 3. Query owned SUI coins to get a gas object id.
-    let gas_object_id = fetch_first_sui_gas_object_id(&mut client, &owner_address).await?;
+    let gas_object_id = fetch_first_sui_gas_object_id(client, &owner_address).await?;
     println!("Selected gas object id: {:?}", gas_object_id);
     debug_main(&format!(
         "[run_bluefin_swap] fetched gas object id: {gas_object_id}"
@@ -382,11 +416,11 @@ async fn run_bluefin_swap() -> Result<(), Box<dyn Error>> {
     let clock_object_id: Address = "0x6".parse()?;
 
     // Fetch object details.
-    let gas_obj = fetch_object_details(&mut client, gas_object_id).await?;
-    let pool_obj = fetch_object_details(&mut client, pool_object_id).await?;
-    let token_obj = fetch_object_details(&mut client, token_object_id).await?;
-    let global_config_obj = fetch_object_details(&mut client, global_config_id).await?;
-    let clock_obj = fetch_object_details(&mut client, clock_object_id).await?;
+    let gas_obj = fetch_object_details(client, gas_object_id).await?;
+    let pool_obj = fetch_object_details(client, pool_object_id).await?;
+    let token_obj = fetch_object_details(client, token_object_id).await?;
+    let global_config_obj = fetch_object_details(client, global_config_id).await?;
+    let clock_obj = fetch_object_details(client, clock_object_id).await?;
 
     // Construct Inputs.
     // Gas (Owned)
@@ -436,7 +470,7 @@ async fn run_bluefin_swap() -> Result<(), Box<dyn Error>> {
     );
 
     let amount_in: u64 = DEFAULT_SWAP_AMOUNT;
-    let a2b: bool = false; // true: SUI -> USDC, false: USDC -> SUI
+    let a2b: bool = true; // true: SUI -> USDC, false: USDC -> SUI
 
     debug_main(&format!(
         "[run_bluefin_swap] swap params: token={token_object_id}, pool={pool_object_id}, amount_in={amount_in}, a2b={a2b}"
@@ -476,11 +510,24 @@ async fn run_bluefin_swap() -> Result<(), Box<dyn Error>> {
     debug_main("[run_bluefin_swap] after execute_transaction");
 
     let elapsed = start.elapsed();
+    let resp_inner = response.into_inner();
+
     println!(
         "Transaction submitted, response: {:?}",
-        response.into_inner()
+        resp_inner
     );
     println!("Elapsed time: {:.3?}", elapsed);
+
+    // 抓取交易 Digest
+    let tx_digest = resp_inner.transaction.as_ref()
+        .and_then(|t| t.effects.as_ref()) 
+        .and_then(|e| e.transaction_digest.as_ref()) 
+        .map(|d| d.to_string())
+        .unwrap_or_else(|| "Unknown".to_string());
+    println!(
+        "🔔 Trigger Checkpoint: {} | ✅ Tx Digest: {} | ⏱️ Latency: {:.3?}",
+        trigger_checkpoint, tx_digest, elapsed
+    );
 
     Ok(())
 }
