@@ -54,6 +54,13 @@ struct TradeContext {
     token_digest: Digest,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct TradeStats {
+    block_lag: i64,      // 區塊延遲
+    price_diff: f64,     // 價格滑點 (%)
+    latency_ms: u128,    // 執行耗時 (ms)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let mut rpc_client = Client::new("http://3.114.103.176:443")?; // 這裡可以是公網，但 JSON-RPC 用本地
@@ -63,9 +70,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let owner_address = public_key.derive_address();
     println!("👤 Owner Address: {:?}", owner_address);
 
-    for round in 1..=10 {
+    let mut all_stats: Vec<TradeStats> = Vec::new();
+
+    for round in 1..=100 {
         println!("\n========================================");
-        println!("🔄 第 {} / 10 次執行開始", round);
+        println!("🔄 第 {} / 100 次執行開始", round);
         println!("========================================");
 
         println!("🔥 正在預熱交易數據...");
@@ -87,7 +96,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         println!("🚀 監控模式啟動，等待 WS 推播...");
 
         // 建立一個通道，讓背景任務通知主程式「我做完了」
-        let (tx_done, rx_done) = oneshot::channel();
+        let (tx_done, rx_done) = oneshot::channel::<Option<TradeStats>>();
         let mut tx_done_opt = Some(tx_done); // Option wrap 避免多次移動
 
         while let Some(msg) = read.next().await {
@@ -134,14 +143,35 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
 
         // 主程式在此等待背景任務完成 (最多等 10 秒)
-        println!("⏳ 主程式等待分析報告中 (Timeout: 10s)...");
+        println!("⏳ 等待分析報告 (Timeout: 10s)...");
         match tokio::time::timeout(tokio::time::Duration::from_secs(10), rx_done).await {
-            Ok(_) => println!("✅ 分析完成，程式正常結束。"),
-            Err(_) => println!("⚠️ 等待逾時：背景分析可能卡住或失敗。"),
+            Ok(Ok(Some(stats))) => {
+                println!("✅ 第 {} 次完成，數據已記錄。", round);
+                all_stats.push(stats); // ✨ 收集數據
+            },
+            Ok(Ok(None)) => println!("⚠️ 第 {} 次分析失敗或無數據。", round),
+            _ => println!("⚠️ 第 {} 次等待逾時。", round),
         }
         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
     }
-    println!("🎉 全部 10 次執行完畢！");
+    println!("🎉 全部 100 次執行完畢！");
+
+    println!("\n========================================");
+    println!("📊 100 次執行總結報告");
+    println!("========================================");
+    if !all_stats.is_empty() {
+        let count = all_stats.len() as f64;
+        let avg_lag: f64 = all_stats.iter().map(|s| s.block_lag as f64).sum::<f64>() / count;
+        let avg_diff: f64 = all_stats.iter().map(|s| s.price_diff.abs()).sum::<f64>() / count; // 取絕對值看誤差幅度
+        let avg_lat: f64 = all_stats.iter().map(|s| s.latency_ms as f64).sum::<f64>() / count;
+
+        println!("✅ 成功樣本數: {} / 10", all_stats.len());
+        println!("⏱️ 平均區塊延遲: {:.2} blocks", avg_lag);
+        println!("💵 平均價格誤差: {:.4}%", avg_diff);
+        println!("⚡️ 平均執行耗時: {:.2} ms", avg_lat);
+    } else {
+        println!("❌ 沒有成功收集到任何數據。");
+    }
 
     Ok(())
 }
@@ -166,7 +196,7 @@ async fn run_fast_swap(
     owner: Address,
     ws_price: f64,
     trigger_digest: String,
-    done_signal: oneshot::Sender<()>, // ✨ 傳入通道
+    done_signal: oneshot::Sender<Option<TradeStats>>, // ✨ 傳入通道
 ) -> Result<(), Box<dyn Error>> {
     let start = Instant::now();
 
@@ -204,13 +234,13 @@ async fn run_fast_swap(
         
         // Spawn 背景任務
         tokio::spawn(async move {
-            analyze_trade_result(digest_clone, trigger_digest, ws_price).await;
+            let stats = analyze_trade_result(digest_clone, trigger_digest, ws_price, elapsed).await;
             // 通知主程式：我做完了
-            let _ = done_signal.send(());
+            let _ = done_signal.send(stats);
         });
     } else {
         // 如果失敗，也要通知主程式不要空等
-        let _ = done_signal.send(());
+        let _ = done_signal.send(None);
     }
 
     Ok(())
@@ -276,7 +306,8 @@ async fn analyze_trade_result(
     digest: String,
     trigger_digest: String,
     ws_price: f64,
-) {
+    exec_latency: std::time::Duration,
+) -> Option<TradeStats>{
     println!("   ... 正在背景追蹤交易 (Trigger: {} -> Tx: {})", trigger_digest, digest);
 
     // 1. 查 Trigger Checkpoint
@@ -353,11 +384,19 @@ async fn analyze_trade_result(
                  println!("   💵 實際成交價: {:.8} (Diff: {:.4}%)", real_price, diff_pct);
                  println!("   📉 真實投入: {:.4} SUI", swap_sui_in);
                  println!("   📈 實際獲得: {:.4} USDC", swap_usdc_out);
+                 println!("   -----------------------------------------\n");
+
+                 // ✨ 新增：回傳統計數據
+                 return Some(TradeStats {
+                     block_lag: if trigger_cp > 0 { exec_cp as i64 - trigger_cp as i64 } else { 0 },
+                     price_diff: diff_pct,
+                     latency_ms: exec_latency.as_millis(),
+                 });
              } else {
-                 println!("   ⚠️ 無法還原 Swap 成本 (可能餘額變動過小)");
+                 println!("   ⚠️ 無法還原 Swap 成本");
              }
              println!("   -----------------------------------------\n");
-             return;
+             return None; // 失敗回傳 None
         }
         
         // 進度顯示
@@ -366,6 +405,7 @@ async fn analyze_trade_result(
         }
     }
     println!("⚠️ [Analysis] 交易 {} 查詢超時", digest);
+    None
 }
 
 // === 初始化函式 (保持不變) ===
