@@ -1,10 +1,12 @@
 use std::error::Error;
 use std::str::FromStr;
+use std::process::Command;
 
 use bech32::FromBase32;
 use sui_crypto::ed25519::Ed25519PrivateKey;
 use sui_crypto::SuiSigner;
 use sui_rpc::Client;
+// 這裡保留需要的 import，移除不需要的以避免警告
 use sui_rpc::proto::sui::rpc::v2::{
     ListOwnedObjectsRequest, GetObjectRequest, GetTransactionRequest
 };
@@ -17,6 +19,7 @@ use futures::{StreamExt, SinkExt};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use url::Url;
 use serde_json::Value;
+use tokio::sync::oneshot; // ✨ 新增：用於通知主程式任務完成
 
 mod bluefin;
 
@@ -36,6 +39,9 @@ const BLUEFIN_TOKEN_OBJECT_ID: &str = "0x66bcedb93c0a58689944a5b8fb532e80c61300c
 const BLUEFIN_TOKEN_A_TYPE: &str = "0x2::sui::SUI";
 const BLUEFIN_TOKEN_B_TYPE: &str = "0xdba34672e30cb065b1f93e3ab55318768fd6fef66c15942c9f7cb846e2f900e7::usdc::USDC";
 
+// ✨ 修改：改用 Localhost，確保防火牆不會擋，且速度最快
+const JSON_RPC_URL: &str = "http://3.114.103.176:443"; 
+
 #[derive(Debug, Clone)]
 struct TradeContext {
     pool_isv: u64,
@@ -51,20 +57,19 @@ struct TradeContext {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    let mut rpc_client = Client::new("http://3.114.103.176:443")?;
+    let mut rpc_client = Client::new("http://3.114.103.176:443")?; // 這裡可以是公網，但 JSON-RPC 用本地
     
     let private_key = decode_sui_private_key(EXAMPLE_PRIVATE_KEY)?;
     let public_key = private_key.public_key();
     let owner_address = public_key.derive_address();
     println!("👤 Owner Address: {:?}", owner_address);
 
-    println!("🔥 正在預熱交易數據 (Fetching Object Details)...");
+    println!("🔥 正在預熱交易數據...");
     let ctx = initialize_trade_context(&mut rpc_client, &owner_address).await?;
     println!("✅ 預熱完成！Pool ISV: {}", ctx.pool_isv);
 
     let ws_url = Url::parse("ws://3.114.103.176:9002/ws")?;
     println!("🔌 連線 WebSocket: {} ...", ws_url);
-
     let (ws_stream, _) = connect_async(ws_url).await?;
     println!("✅ WebSocket 已連線");
 
@@ -75,32 +80,25 @@ async fn main() -> Result<(), Box<dyn Error>> {
         "pool_id": BLUEFIN_POOL_ID
     });
     write.send(Message::Text(subscribe_msg.to_string())).await?;
-    println!("Pw 訂閱請求已發送");
-
     println!("🚀 監控模式啟動，等待 WS 推播...");
+
+    // 建立一個通道，讓背景任務通知主程式「我做完了」
+    let (tx_done, rx_done) = oneshot::channel();
+    let mut tx_done_opt = Some(tx_done); // Option wrap 避免多次移動
 
     while let Some(msg) = read.next().await {
         match msg {
             Ok(Message::Text(text)) => {
                 if let Ok(json) = serde_json::from_str::<Value>(&text) {
-                    let msg_type = json["type"].as_str().unwrap_or("");
-
-                    if msg_type == "pool_update" {
-                        let _pool_id = json["pool_id"].as_str().unwrap_or("Unknown");
-                        let version = json["version"].as_u64().map(|v| v.to_string())
-                            .or_else(|| json["version"].as_str().map(|s| s.to_string()))
-                            .unwrap_or("N/A".to_string());
-                        
+                    if json["type"].as_str() == Some("pool_update") {
+                        let version = json["version"].as_u64().map(|v| v.to_string()).unwrap_or("N/A".to_string());
                         let trigger_digest = json["digest"].as_str().unwrap_or("Unknown").to_string();
-
+                        
+                        // 解析價格顯示
                         let mut price_display = "N/A".to_string();
                         let mut ws_price_f64 = 0.0;
-
                         if let Some(obj_array) = json["object"].as_array() {
-                            let raw_bytes: Vec<u8> = obj_array.iter()
-                                .map(|v| v.as_u64().unwrap_or(0) as u8)
-                                .collect();
-                            
+                            let raw_bytes: Vec<u8> = obj_array.iter().map(|v| v.as_u64().unwrap_or(0) as u8).collect();
                             if let Some(price) = get_bluefin_price(&raw_bytes) {
                                 ws_price_f64 = price;
                                 price_display = format!("{:.8}", price);
@@ -111,14 +109,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         println!("   🔗 Trigger Digest: {}", trigger_digest);
                         println!("   💰 WS Sort Price: {}", price_display);
 
-                        match run_fast_swap(&mut rpc_client, &ctx, &private_key, owner_address, ws_price_f64, trigger_digest).await {
-                            Ok(_) => {
-                                println!("✅ 交易發送成功！程式結束 (單次測試)");
-                                break; 
+                        // 觸發交易，並傳入通知通道
+                        if let Some(done_sender) = tx_done_opt.take() {
+                             match run_fast_swap(&mut rpc_client, &ctx, &private_key, owner_address, ws_price_f64, trigger_digest, done_sender).await {
+                                Ok(_) => {
+                                    println!("✅ 交易發送成功！等待背景分析...");
+                                    break; // 跳出 WS 迴圈，進入等待模式
+                                }
+                                Err(e) => eprintln!("❌ 交易發送失敗: {}", e),
                             }
-                            Err(e) => eprintln!("❌ 交易發送失敗: {}", e),
                         }
-                    } else if msg_type == "SubscriptionSuccess" {
+                    } else if json["type"].as_str() == Some("SubscriptionSuccess") {
                         println!("✅ 訂閱成功");
                     }
                 }
@@ -128,30 +129,27 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     }
 
-    println!("⏳ 測試模式：主程式等待 10 秒讓背景分析完成...");
-    tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+    // 主程式在此等待背景任務完成 (最多等 30 秒)
+    println!("⏳ 主程式等待分析報告中 (Timeout: 30s)...");
+    match tokio::time::timeout(tokio::time::Duration::from_secs(30), rx_done).await {
+        Ok(_) => println!("✅ 分析完成，程式正常結束。"),
+        Err(_) => println!("⚠️ 等待逾時：背景分析可能卡住或失敗。"),
+    }
 
     Ok(())
 }
 
 fn get_bluefin_price(data: &[u8]) -> Option<f64> {
     let offset = 279;
-    if data.len() < offset + 16 {
-        return None;
-    }
+    if data.len() < offset + 16 { return None; }
     let chunk = &data[offset..offset+16];
     let low = u64::from_le_bytes(chunk[0..8].try_into().ok()?);
     let high = u64::from_le_bytes(chunk[8..16].try_into().ok()?);
     let sqrt_price = ((high as u128) << 64) | (low as u128);
-
     let multiplier = 1000.0;
-    let sqrt_price_f = sqrt_price as f64;
     let denom = (1u128 << 64) as f64; 
-    
-    let raw_price = (sqrt_price_f / denom).powi(2);
-    let sort_price = raw_price * multiplier;
-
-    Some(sort_price)
+    let raw_price = (sqrt_price as f64 / denom).powi(2);
+    Some(raw_price * multiplier)
 }
 
 async fn run_fast_swap(
@@ -161,41 +159,19 @@ async fn run_fast_swap(
     owner: Address,
     ws_price: f64,
     trigger_digest: String,
+    done_signal: oneshot::Sender<()>, // ✨ 傳入通道
 ) -> Result<(), Box<dyn Error>> {
     let start = Instant::now();
 
-    let gas_input = Input::by_id(ctx.gas_object_id)
-        .with_owned_kind()
-        .with_version(ctx.gas_version)
-        .with_digest(ctx.gas_digest);
-
-    let token_input = Input::by_id(ctx.token_object_id)
-        .with_owned_kind()
-        .with_version(ctx.token_version)
-        .with_digest(ctx.token_digest);
-
-    let pool_input = Input::by_id(Address::from_str(BLUEFIN_POOL_ID)?)
-        .with_shared_kind()
-        .with_initial_shared_version(ctx.pool_isv)
-        .by_val();
-
-    let global_config_input = Input::by_id(Address::from_str(BLUEFIN_GLOBAL_CONFIG_ID)?)
-        .with_shared_kind()
-        .with_initial_shared_version(ctx.global_config_isv)
-        .by_ref();
-
-    let clock_input = Input::by_id(Address::from_str("0x6")?)
-        .with_shared_kind()
-        .with_initial_shared_version(ctx.clock_isv)
-        .by_ref();
-
-    let amount_in = DEFAULT_SWAP_AMOUNT;
-    let a2b = true; 
+    let gas_input = Input::by_id(ctx.gas_object_id).with_owned_kind().with_version(ctx.gas_version).with_digest(ctx.gas_digest);
+    let token_input = Input::by_id(ctx.token_object_id).with_owned_kind().with_version(ctx.token_version).with_digest(ctx.token_digest);
+    let pool_input = Input::by_id(Address::from_str(BLUEFIN_POOL_ID)?).with_shared_kind().with_initial_shared_version(ctx.pool_isv).by_val();
+    let global_config_input = Input::by_id(Address::from_str(BLUEFIN_GLOBAL_CONFIG_ID)?).with_shared_kind().with_initial_shared_version(ctx.global_config_isv).by_ref();
+    let clock_input = Input::by_id(Address::from_str("0x6")?).with_shared_kind().with_initial_shared_version(ctx.clock_isv).by_ref();
 
     let tx = bluefin::create_bluefin_swap_transaction(
         token_input, pool_input, global_config_input, clock_input, gas_input,
-        amount_in, a2b, owner, 
-        DEFAULT_GAS_BUDGET, DEFAULT_GAS_PRICE,
+        DEFAULT_SWAP_AMOUNT, true, owner, DEFAULT_GAS_BUDGET, DEFAULT_GAS_PRICE,
         BLUEFIN_TOKEN_A_TYPE, BLUEFIN_TOKEN_B_TYPE,
     )?;
 
@@ -214,131 +190,172 @@ async fn run_fast_swap(
         .map(|d| d.to_string())
         .unwrap_or_else(|| "Unknown".to_string());
 
-    println!(
-        "🚀 Tx Sent! Digest: {} | ⏱️ Latency: {:.3?}",
-        tx_digest, elapsed
-    );
+    println!("🚀 Tx Sent! Digest: {} | ⏱️ Latency: {:.3?}", tx_digest, elapsed);
 
     if tx_digest != "Unknown" {
         let digest_clone = tx_digest.clone();
-        let rpc_url = "http://3.114.103.176:443".to_string();
         
+        // Spawn 背景任務
         tokio::spawn(async move {
-            analyze_trade_result(rpc_url, digest_clone, trigger_digest, ws_price).await;
+            analyze_trade_result(digest_clone, trigger_digest, ws_price).await;
+            // 通知主程式：我做完了
+            let _ = done_signal.send(());
         });
+    } else {
+        // 如果失敗，也要通知主程式不要空等
+        let _ = done_signal.send(());
     }
 
     Ok(())
 }
 
+/// 使用 curl 呼叫 JSON-RPC，並增加錯誤日誌
+fn fetch_tx_info_via_curl(digest: &str) -> Option<(u64, Value)> {
+    let payload = serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "sui_getTransactionBlock",
+        "params": [
+            digest,
+            {
+                "showInput": false, "showRawInput": false, "showEffects": true,
+                "showEvents": false, "showObjectChanges": false, "showBalanceChanges": true
+            }
+        ]
+    });
+
+    // 呼叫 curl
+    let output = Command::new("curl")
+        .arg("-s")
+        .arg("-X").arg("POST")
+        .arg("-H").arg("Content-Type: application/json")
+        .arg("-d").arg(payload.to_string())
+        .arg(JSON_RPC_URL) // 使用 Localhost
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        eprintln!("❌ Curl failed with status: {:?}", output.status);
+        return None;
+    }
+
+    let resp_text = String::from_utf8(output.stdout).ok()?;
+    
+    // 嘗試解析 JSON
+    let json: Value = match serde_json::from_str(&resp_text) {
+        Ok(v) => v,
+        Err(_) => {
+            // 如果解析失敗，印出原始文字看看是不是 Nginx 錯誤或空值
+            // eprintln!("❌ JSON Parse Error. Raw: {}", resp_text);
+            return None;
+        }
+    };
+
+    if let Some(err) = json.get("error") {
+        // 這是正常的，代表還沒查到 (Not found)
+        // eprintln!("⚠️ RPC Error: {:?}", err); 
+        return None;
+    }
+
+    let checkpoint = json["result"]["checkpoint"].as_str()
+        .and_then(|s| s.parse::<u64>().ok());
+
+    if let Some(cp) = checkpoint {
+        Some((cp, json["result"].clone()))
+    } else {
+        None
+    }
+}
+
 async fn analyze_trade_result(
-    rpc_url: String, 
     digest: String,
     trigger_digest: String,
     ws_price: f64,
 ) {
-    let mut client = match Client::new(&rpc_url) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("❌ [Analysis] 無法建立 Client: {}", e);
-            return;
-        }
-    };
-    
-    let mut ledger_client = client.ledger_client();
     println!("   ... 正在背景追蹤交易 (Trigger: {} -> Tx: {})", trigger_digest, digest);
 
-    // 暫時跳過 Checkpoint 查詢，專注於解析金額
+    // 1. 查 Trigger Checkpoint
+    let mut trigger_cp = 0;
+    println!("   ... [1/2] 查詢 Trigger CP ...");
+    for _ in 0..10 { // 試 5 秒
+        if let Some((cp, _)) = fetch_tx_info_via_curl(&trigger_digest) {
+            trigger_cp = cp;
+            break;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    }
 
-    for _ in 1..=20 {
+    if trigger_cp == 0 {
+        println!("   ⚠️ 無法查到 Trigger CP (可能節點尚未索引 WS 推播的交易)");
+    }
+
+    // 2. 查 User Tx
+    println!("   ... [2/2] 查詢 My Tx CP ...");
+    for i in 1..=40 { // 延長到 20 秒
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
-        let mut request = GetTransactionRequest::default();
-        request.digest = Some(digest.clone());
-        request.read_mask = Some(FieldMask {
-            paths: vec![
-                "transaction".to_string(),
-                "effects".to_string(), 
-                "balance_changes".to_string(),
-                // "checkpoint_sequence_number".to_string() // 暫時移除以通過編譯
-            ],
-        });
+        if let Some((exec_cp, result)) = fetch_tx_info_via_curl(&digest) {
+             println!("\n📊 [交易分析報告] {}", digest);
+             println!("   -----------------------------------------");
+             
+             if trigger_cp > 0 {
+                 let diff = exec_cp as i64 - trigger_cp as i64;
+                 println!("   ⏱️ 區塊延遲: {} blocks (Trigger: {} -> Exec: {})", diff, trigger_cp, exec_cp);
+             } else {
+                 println!("   ⏱️ 區塊延遲: 未知 (Trigger未查到) -> Exec: {}", exec_cp);
+             }
+             
+             println!("   💰 WS 觸發價: {:.8}", ws_price);
 
-        if let Ok(response) = ledger_client.get_transaction(request).await {
-            let resp = response.into_inner();
-            
-            // 直接解包 transaction
-            if let Some(tx_block) = resp.transaction {
-                
-                // 確認已執行 (檢查 effects)
-                if let Some(effects) = &tx_block.effects {
-                    
-                    println!("\n📊 [交易分析報告] {}", digest);
-                    println!("   -----------------------------------------");
-                    println!("   ✅ 交易已上鏈 (Confirmed)");
-                    
-                    println!("   💰 WS 觸發價: {:.8}", ws_price);
+             // 解析真實成本
+             let mut net_gas_fee: u64 = 0;
+             if let Some(gas_summary) = result["effects"]["gasUsed"].as_object() {
+                 let comp = gas_summary["computationCost"].as_str().unwrap_or("0").parse::<u64>().unwrap_or(0);
+                 let storage = gas_summary["storageCost"].as_str().unwrap_or("0").parse::<u64>().unwrap_or(0);
+                 let rebate = gas_summary["storageRebate"].as_str().unwrap_or("0").parse::<u64>().unwrap_or(0);
+                 let total_cost = comp + storage;
+                 if total_cost > rebate { net_gas_fee = total_cost - rebate; }
+             }
 
-                    let mut net_gas_fee: u64 = 0;
-                    
-                    // 計算 Gas Fee
-                    if let Some(gas_summary) = &effects.gas_used {
-                        let comp = gas_summary.computation_cost.unwrap_or(0);
-                        let storage = gas_summary.storage_cost.unwrap_or(0);
-                        let rebate = gas_summary.storage_rebate.unwrap_or(0);
-                        
-                        let total_cost = comp + storage;
-                        if total_cost > rebate {
-                            net_gas_fee = total_cost - rebate;
-                        }
-                    }
+             let mut swap_sui_in = 0.0;
+             let mut swap_usdc_out = 0.0;
 
-                    let mut swap_sui_in = 0.0;
-                    let mut swap_usdc_out = 0.0;
-                    
-                    // 修正：直接迭代 Vec (解決 mismatched types 錯誤)
-                    for change in tx_block.balance_changes {
-                         let coin_type = change.coin_type.unwrap_or_default();
-                         let amount_str = change.amount.unwrap_or_default();
-                         
-                         // 明確指定型別為 i128
-                         if let Ok(amount_i128) = amount_str.parse::<i128>() {
-                             
-                             if coin_type.contains("sui::SUI") {
-                                 // SUI 流出量 (Input + Gas)
-                                 if amount_i128 < 0 {
-                                     // 修正：明確指定 abs() 運算後的型別 (解決 type annotation 錯誤)
-                                     let total_out_abs: i128 = amount_i128.abs();
-                                     let total_out = total_out_abs as u64;
-
-                                     if total_out > net_gas_fee {
-                                         // 還原真實 Swap 投入
-                                         swap_sui_in = (total_out - net_gas_fee) as f64 / 1_000_000_000.0;
-                                     }
-                                 }
-                             } else if coin_type.contains("usdc::USDC") {
-                                 // USDC 流入量
-                                 if amount_i128 > 0 {
-                                     swap_usdc_out = (amount_i128 as f64) / 1_000_000.0;
+             if let Some(changes) = result["balanceChanges"].as_array() {
+                 for change in changes {
+                     let coin_type = change["coinType"].as_str().unwrap_or("");
+                     let amount_str = change["amount"].as_str().unwrap_or("0");
+                     
+                     if let Ok(amount_i128) = amount_str.parse::<i128>() {
+                         if coin_type.contains("sui::SUI") {
+                             if amount_i128 < 0 {
+                                 let total_out_abs = amount_i128.abs() as u64;
+                                 if total_out_abs > net_gas_fee {
+                                     swap_sui_in = (total_out_abs - net_gas_fee) as f64 / 1_000_000_000.0;
                                  }
                              }
+                         } else if coin_type.contains("usdc::USDC") {
+                             if amount_i128 > 0 {
+                                 swap_usdc_out = (amount_i128 as f64) / 1_000_000.0;
+                             }
                          }
-                    }
+                     }
+                 }
+             }
 
-                    if swap_sui_in > 0.0 {
-                        let real_price = swap_usdc_out / swap_sui_in;
-                        let diff_pct = ((real_price - ws_price) / ws_price) * 100.0;
-                        println!("   💵 實際成交價: {:.8} (Diff: {:.4}%)", real_price, diff_pct);
-                        println!("   📉 真實投入: {:.4} SUI (已扣除 Gas: {:.4})", swap_sui_in, net_gas_fee as f64 / 1_000_000_000.0);
-                        println!("   📈 實際獲得: {:.4} USDC", swap_usdc_out);
-                    } else {
-                        println!("   ⚠️ 無法還原 Swap 成本 (Gas 佔比過高或資料異常)");
-                    }
-
-                    println!("   -----------------------------------------\n");
-                    return;
-                }
-            }
+             if swap_sui_in > 0.0 {
+                 let real_price = swap_usdc_out / swap_sui_in;
+                 let diff_pct = ((real_price - ws_price) / ws_price) * 100.0;
+                 println!("   💵 實際成交價: {:.8} (Diff: {:.4}%)", real_price, diff_pct);
+                 println!("   📉 真實投入: {:.4} SUI", swap_sui_in);
+                 println!("   📈 實際獲得: {:.4} USDC", swap_usdc_out);
+             } else {
+                 println!("   ⚠️ 無法還原 Swap 成本 (可能餘額變動過小)");
+             }
+             println!("   -----------------------------------------\n");
+             return;
+        }
+        
+        // 進度顯示
+        if i % 5 == 0 {
+            println!("   ... 正在等待節點索引 ({}s)...", i / 2);
         }
     }
     println!("⚠️ [Analysis] 交易 {} 查詢超時", digest);
