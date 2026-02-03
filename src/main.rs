@@ -34,7 +34,6 @@ const EXAMPLE_PRIVATE_KEY: &str = "suiprivkey1qzcq4jx6g0a8jmpwer0wfpr5kc8r2mfrmk
 // ====== Bluefin constants ======
 const BLUEFIN_GLOBAL_CONFIG_ID: &str = "0x03db251ba509a8d5d8777b6338836082335d93eecbdd09a11e190a1cff51c352";
 const BLUEFIN_POOL_ID: &str = "0x15dbcac854b1fc68fc9467dbd9ab34270447aabd8cc0e04a5864d95ccb86b74a";
-const BLUEFIN_TOKEN_OBJECT_ID: &str = "0x66bcedb93c0a58689944a5b8fb532e80c61300c8f8bf608f47d35dd0736c91b5";
 
 const BLUEFIN_TOKEN_A_TYPE: &str = "0x2::sui::SUI";
 const BLUEFIN_TOKEN_B_TYPE: &str = "0xdba34672e30cb065b1f93e3ab55318768fd6fef66c15942c9f7cb846e2f900e7::usdc::USDC";
@@ -64,77 +63,85 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let owner_address = public_key.derive_address();
     println!("👤 Owner Address: {:?}", owner_address);
 
-    println!("🔥 正在預熱交易數據...");
-    let ctx = initialize_trade_context(&mut rpc_client, &owner_address).await?;
-    println!("✅ 預熱完成！Pool ISV: {}", ctx.pool_isv);
+    for round in 1..=10 {
+        println!("\n========================================");
+        println!("🔄 第 {} / 10 次執行開始", round);
+        println!("========================================");
 
-    let ws_url = Url::parse("ws://3.114.103.176:9002/ws")?;
-    println!("🔌 連線 WebSocket: {} ...", ws_url);
-    let (ws_stream, _) = connect_async(ws_url).await?;
-    println!("✅ WebSocket 已連線");
+        println!("🔥 正在預熱交易數據...");
+        let ctx = initialize_trade_context(&mut rpc_client, &owner_address).await?;
+        println!("✅ 預熱完成！Pool ISV: {}", ctx.pool_isv);
 
-    let (mut write, mut read) = ws_stream.split();
+        let ws_url = Url::parse("ws://3.114.103.176:9002/ws")?;
+        println!("🔌 連線 WebSocket: {} ...", ws_url);
+        let (ws_stream, _) = connect_async(ws_url).await?;
+        println!("✅ WebSocket 已連線");
 
-    let subscribe_msg = serde_json::json!({
-        "type": "subscribe_pool",
-        "pool_id": BLUEFIN_POOL_ID
-    });
-    write.send(Message::Text(subscribe_msg.to_string())).await?;
-    println!("🚀 監控模式啟動，等待 WS 推播...");
+        let (mut write, mut read) = ws_stream.split();
 
-    // 建立一個通道，讓背景任務通知主程式「我做完了」
-    let (tx_done, rx_done) = oneshot::channel();
-    let mut tx_done_opt = Some(tx_done); // Option wrap 避免多次移動
+        let subscribe_msg = serde_json::json!({
+            "type": "subscribe_pool",
+            "pool_id": BLUEFIN_POOL_ID
+        });
+        write.send(Message::Text(subscribe_msg.to_string())).await?;
+        println!("🚀 監控模式啟動，等待 WS 推播...");
 
-    while let Some(msg) = read.next().await {
-        match msg {
-            Ok(Message::Text(text)) => {
-                if let Ok(json) = serde_json::from_str::<Value>(&text) {
-                    if json["type"].as_str() == Some("pool_update") {
-                        let version = json["version"].as_u64().map(|v| v.to_string()).unwrap_or("N/A".to_string());
-                        let trigger_digest = json["digest"].as_str().unwrap_or("Unknown").to_string();
-                        
-                        // 解析價格顯示
-                        let mut price_display = "N/A".to_string();
-                        let mut ws_price_f64 = 0.0;
-                        if let Some(obj_array) = json["object"].as_array() {
-                            let raw_bytes: Vec<u8> = obj_array.iter().map(|v| v.as_u64().unwrap_or(0) as u8).collect();
-                            if let Some(price) = get_bluefin_price(&raw_bytes) {
-                                ws_price_f64 = price;
-                                price_display = format!("{:.8}", price);
-                            }
-                        }
+        // 建立一個通道，讓背景任務通知主程式「我做完了」
+        let (tx_done, rx_done) = oneshot::channel();
+        let mut tx_done_opt = Some(tx_done); // Option wrap 避免多次移動
 
-                        println!("\n⚡️ Pool Update! Ver: {}", version);
-                        println!("   🔗 Trigger Digest: {}", trigger_digest);
-                        println!("   💰 WS Sort Price: {}", price_display);
-
-                        // 觸發交易，並傳入通知通道
-                        if let Some(done_sender) = tx_done_opt.take() {
-                             match run_fast_swap(&mut rpc_client, &ctx, &private_key, owner_address, ws_price_f64, trigger_digest, done_sender).await {
-                                Ok(_) => {
-                                    println!("✅ 交易發送成功！等待背景分析...");
-                                    break; // 跳出 WS 迴圈，進入等待模式
+        while let Some(msg) = read.next().await {
+            match msg {
+                Ok(Message::Text(text)) => {
+                    if let Ok(json) = serde_json::from_str::<Value>(&text) {
+                        if json["type"].as_str() == Some("pool_update") {
+                            let version = json["version"].as_u64().map(|v| v.to_string()).unwrap_or("N/A".to_string());
+                            let trigger_digest = json["digest"].as_str().unwrap_or("Unknown").to_string();
+                            
+                            // 解析價格顯示
+                            let mut price_display = "N/A".to_string();
+                            let mut ws_price_f64 = 0.0;
+                            if let Some(obj_array) = json["object"].as_array() {
+                                let raw_bytes: Vec<u8> = obj_array.iter().map(|v| v.as_u64().unwrap_or(0) as u8).collect();
+                                if let Some(price) = get_bluefin_price(&raw_bytes) {
+                                    ws_price_f64 = price;
+                                    price_display = format!("{:.8}", price);
                                 }
-                                Err(e) => eprintln!("❌ 交易發送失敗: {}", e),
                             }
+
+                            println!("\n⚡️ Pool Update! Ver: {}", version);
+                            println!("   🔗 Trigger Digest: {}", trigger_digest);
+                            println!("   💰 WS Sort Price: {}", price_display);
+
+                            // 觸發交易，並傳入通知通道
+                            if let Some(done_sender) = tx_done_opt.take() {
+                                match run_fast_swap(&mut rpc_client, &ctx, &private_key, owner_address, ws_price_f64, trigger_digest, done_sender).await {
+                                    Ok(_) => {
+                                        println!("✅ 交易發送成功！等待背景分析...");
+                                        break; // 跳出 WS 迴圈，進入等待模式
+                                    }
+                                    Err(e) => eprintln!("❌ 交易發送失敗: {}", e),
+                                }
+                            }
+                        } else if json["type"].as_str() == Some("SubscriptionSuccess") {
+                            println!("✅ 訂閱成功");
                         }
-                    } else if json["type"].as_str() == Some("SubscriptionSuccess") {
-                        println!("✅ 訂閱成功");
                     }
                 }
+                Ok(_) => {},
+                Err(e) => eprintln!("WS Error: {}", e),
             }
-            Ok(_) => {},
-            Err(e) => eprintln!("WS Error: {}", e),
         }
-    }
 
-    // 主程式在此等待背景任務完成 (最多等 30 秒)
-    println!("⏳ 主程式等待分析報告中 (Timeout: 30s)...");
-    match tokio::time::timeout(tokio::time::Duration::from_secs(30), rx_done).await {
-        Ok(_) => println!("✅ 分析完成，程式正常結束。"),
-        Err(_) => println!("⚠️ 等待逾時：背景分析可能卡住或失敗。"),
+        // 主程式在此等待背景任務完成 (最多等 10 秒)
+        println!("⏳ 主程式等待分析報告中 (Timeout: 10s)...");
+        match tokio::time::timeout(tokio::time::Duration::from_secs(10), rx_done).await {
+            Ok(_) => println!("✅ 分析完成，程式正常結束。"),
+            Err(_) => println!("⚠️ 等待逾時：背景分析可能卡住或失敗。"),
+        }
+        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
     }
+    println!("🎉 全部 10 次執行完畢！");
 
     Ok(())
 }
@@ -377,7 +384,7 @@ async fn initialize_trade_context(
     let gas_id = fetch_first_sui_gas_object_id(client, owner).await?;
     let gas_obj = fetch_object_details(client, gas_id).await?;
 
-    let token_id: Address = BLUEFIN_TOKEN_OBJECT_ID.parse()?;
+    let token_id = fetch_sui_coin_excluding_gas(client, owner, gas_id).await?; 
     let token_obj = fetch_object_details(client, token_id).await?;
 
     Ok(TradeContext {
@@ -414,6 +421,35 @@ async fn fetch_first_sui_gas_object_id(
     if response.objects.is_empty() { return Err("No SUI gas objects found".into()); }
     let oid_str = response.objects[0].object_id.as_ref().ok_or("Missing object_id")?;
     Ok(oid_str.parse()?)
+}
+
+// ✨ 新增：找出一個不是 Gas 的 SUI Coin
+async fn fetch_sui_coin_excluding_gas(
+    client: &mut Client,
+    owner: &Address,
+    gas_id: Address,
+) -> Result<Address, Box<dyn Error>> {
+    let mut state_client = client.state_client();
+    let mut request = ListOwnedObjectsRequest::default();
+    request.owner = Some(owner.to_string());
+    // 這裡假設我們要 Swap 的是 SUI，如果我們要 Swap 其他幣種 (如 USDC)，要改這裡的 Type
+    request.object_type = Some("0x2::coin::Coin<0x2::sui::SUI>".to_string());
+    request.read_mask = Some(FieldMask { paths: vec!["object_id".to_string()] });
+
+    // 取得列表
+    let response = state_client.list_owned_objects(request).await?.into_inner();
+    
+    // 遍歷所有 SUI Coin，找出第一個 ID 不等於 gas_id 的
+    for obj in response.objects {
+        if let Some(oid_str) = obj.object_id.as_ref() {
+            let oid: Address = oid_str.parse()?;
+            if oid != gas_id {
+                return Ok(oid);
+            }
+        }
+    }
+    
+    Err("無法找到第二個 SUI Coin (你需要至少有兩個 SUI Objects，一個付 Gas，一個做交易)".into())
 }
 
 async fn fetch_object_details(
