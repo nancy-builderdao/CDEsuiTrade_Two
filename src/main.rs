@@ -80,6 +80,7 @@ enum SwapType {
 struct TradeStats {
     latency_ms: u128,
     lag: i64,
+    price_diff: f64,
 }
 
 #[tokio::main]
@@ -117,8 +118,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             let cursor = resp.cursor.unwrap_or_default();
                             println!("⚡️ 收到最新 Checkpoint: {}", cursor);
 
-                            // 3. 執行交易
-                            if let Err(e) = run_bluefin_swap(&mut action_client, cursor, tx.clone()).await {
+                            let mut trigger_price = 0.0;
+                            match fetch_current_pool_price(&mut monitor_client, BLUEFIN_POOL_ID).await {
+                                Ok(price) => {
+                                    trigger_price = price;
+                                    println!("💰 當前 gRPC 池子價格: {:.4}", price);
+                                },
+                                Err(e) => eprintln!("⚠️ 查價失敗: {}", e),
+                            }
+
+                            // ✨ 修改：把 trigger_price 傳進去
+                            if let Err(e) = run_bluefin_swap(&mut action_client, cursor, tx.clone(), trigger_price).await {
                                 eprintln!("❌ 交易執行失敗: {}", e);
                             }
                             
@@ -141,18 +151,38 @@ async fn main() -> Result<(), Box<dyn Error>> {
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
     }
 
-    // 計算並印出平均值
-    println!("\n📊 ========== 測試總結報告 ({} 次) ==========", target_runs);
-    if !results.is_empty() {
-        let avg_latency: f64 = results.iter().map(|s| s.latency_ms as f64).sum::<f64>() / results.len() as f64;
-        let avg_lag: f64 = results.iter().map(|s| s.lag as f64).sum::<f64>() / results.len() as f64;
+    println!("\n========================================");
+    println!("📊 {} 次執行總結報告", target_runs);
+    println!("========================================");
 
-        println!("⚡️ 平均執行耗時 (Latency): {:.2} ms", avg_latency);
-        println!("⏱️ 平均區塊延遲 (Checkpoint Lag): {:.2}", avg_lag);
+    if !results.is_empty() {
+        let count = results.len() as f64;
+        
+        let avg_latency = results.iter().map(|s| s.latency_ms as f64).sum::<f64>() / count;
+        let avg_lag = results.iter().map(|s| s.lag as f64).sum::<f64>() / count;
+        // 取絕對值 (abs) 來計算誤差幅度，避免正負抵銷
+        let avg_diff = results.iter().map(|s| s.price_diff.abs()).sum::<f64>() / count;
+
+        println!("✅ 成功樣本數: {} / {}", results.len(), target_runs);
+        println!("⏱️ 平均區塊延遲: {:.2} blocks", avg_lag);
+        println!("💵 平均價格誤差: {:.4}%", avg_diff);
+        println!("⚡️ 平均執行耗時: {:.2} ms", avg_latency);
+
+        println!("\n📋 [詳細數據列表] (Round | Latency | Lag | Diff%)");
+        println!("--------------------------------------------------");
+        for (i, stats) in results.iter().enumerate() {
+            println!(
+                "{:<3} | {:<4} ms | {:<2} blocks | {:.4}%", 
+                i + 1, 
+                stats.latency_ms, 
+                stats.lag, 
+                stats.price_diff
+            );
+        }
+        println!("--------------------------------------------------\n");
     } else {
         println!("❌ 沒有成功收集到數據");
     }
-    println!("==============================================");
 
     Ok(())
 }
@@ -428,7 +458,8 @@ async fn run_cetus_swap() -> Result<(), Box<dyn Error>> {
 async fn run_bluefin_swap(
     client: &mut Client, 
     trigger_checkpoint: u64,
-    tx_sender: mpsc::Sender<TradeStats>
+    tx_sender: mpsc::Sender<TradeStats>,
+    trigger_price: f64
 ) -> Result<(), Box<dyn Error>> {
     debug_main("[run_bluefin_swap] start");
     let start = Instant::now();
@@ -578,16 +609,62 @@ async fn run_bluefin_swap(
         let digest_clone = tx_digest.clone();
         let latency_ms = elapsed.as_millis(); // 轉成 ms
         
-        // ✨ 修改：將 sender 傳入背景任務
         tokio::spawn(async move {
-            check_lag_background(tx_sender, digest_clone, trigger_checkpoint, latency_ms).await;
+            check_lag_background(tx_sender, digest_clone, trigger_checkpoint, latency_ms, trigger_price).await;
         });
     } else {
         // 如果交易失敗沒 Digest，也送一個空的結果回去，避免主程式卡死
-        let _ = tx_sender.send(TradeStats { latency_ms: elapsed.as_millis(), lag: -1 }).await;
+        let _ = tx_sender.send(TradeStats { 
+            latency_ms: elapsed.as_millis(), 
+            lag: -1,
+            price_diff: 0.0 // ✨ 修正：補上這個欄位，預設為 0.0
+        }).await;
     }
 
     Ok(())
+}
+
+// ✨ 新增：計算 Bluefin 價格 (把 u128 的 sqrt_price 轉成人類看得懂的價格)
+fn calculate_bluefin_price(sqrt_price_str: &str, is_sui_usdc: bool) -> Result<f64, Box<dyn Error>> {
+    let sqrt_price = sqrt_price_str.parse::<u128>()?;
+    
+    // Q64.64 定點數轉換
+    let q64 = (1u128 << 64) as f64;
+    let price_raw = (sqrt_price as f64 / q64).powi(2);
+
+    // 如果是 SUI/USDC (SUI=9 decimals, USDC=6 decimals)
+    // 價格通常是 USDC / SUI，所以要乘上 10^(9-6) = 1000
+    // 如果你的觀察發現價格差 1000 倍，請調整這個 multiplier
+    let multiplier = if is_sui_usdc { 1000.0 } else { 1.0 };
+    
+    Ok(price_raw * multiplier)
+}
+
+async fn fetch_current_pool_price(client: &mut Client, pool_id_str: &str) -> Result<f64, Box<dyn Error>> {
+    let mut ledger_client = client.ledger_client();
+    let pool_id: Address = pool_id_str.parse()?;
+    
+    let mut request = GetObjectRequest::new(&pool_id);
+    request.read_mask = Some(FieldMask {
+        paths: vec!["json".to_string()] 
+    });
+
+    let response = ledger_client.get_object(request).await?.into_inner();
+    
+    if let Some(json_content) = response.object.and_then(|o| o.json) {
+        if let Some(prost_types::value::Kind::StructValue(st)) = &json_content.kind {
+            // 使用新的遞迴搜尋
+            if let Some(price_str) = extract_price_from_prost_struct(st) {
+                 return calculate_bluefin_price(&price_str, true);
+            } else {
+                // ✨ Debug: 如果找不到，印出頂層有哪些 key，方便除錯
+                let keys: Vec<&String> = st.fields.keys().collect();
+                eprintln!("⚠️ gRPC JSON 結構中找不到 current_sqrt_price。頂層 Keys: {:?}", keys);
+            }
+        }
+    }
+    
+    Err("無法解析 Pool 價格 (欄位結構不符)".into())
 }
 
 /// Decode Sui Ed25519 private key from bech32 "suiprivkey..." string.
@@ -713,14 +790,16 @@ async fn check_lag_background(
     tx_sender: mpsc::Sender<TradeStats>, 
     tx_digest: String, 
     trigger_checkpoint: u64,
-    latency_ms: u128
+    latency_ms: u128,      // ✨ 修正：補上逗號
+    trigger_price: f64     // ✨ 這是我們從 gRPC 查到的價格
 ) {
-    // 1. 先睡個 1.5 秒
+    // 1. 等待節點索引
     tokio::time::sleep(tokio::time::Duration::from_millis(1500)).await;
 
     let rpc_url = "http://3.114.103.176:443";
     let client = reqwest::Client::new();
 
+    // ✨ 修改：必須把 showEffects 和 showBalanceChanges 設為 true 才能算價格
     let body = json!({
         "jsonrpc": "2.0",
         "id": 1,
@@ -730,16 +809,16 @@ async fn check_lag_background(
             {
                 "showInput": false,
                 "showRawInput": false,
-                "showEffects": false,
+                "showEffects": true,          // ✨ 改為 true (為了算 Gas)
                 "showEvents": false,
                 "showObjectChanges": false,
-                "showBalanceChanges": false
+                "showBalanceChanges": true    // ✨ 改為 true (為了算 Swap 金額)
             }
         ]
     });
 
-    // ✨ 修正 1：在這裡宣告變數，預設為 0
     let mut lag_result: i64 = 0; 
+    let mut price_diff_result: f64 = 0.0;
 
     match client.post(rpc_url).json(&body).send().await {
         Ok(resp) => {
@@ -747,11 +826,75 @@ async fn check_lag_background(
                 if let Some(tx_cp_str) = json["result"]["checkpoint"].as_str() {
                     if let Ok(tx_cp) = tx_cp_str.parse::<u64>() {
                         let lag = tx_cp as i64 - trigger_checkpoint as i64;
+                        
+                        println!("\n📊 [交易分析] Tx: {}", tx_digest);
+                        println!("   -----------------------------------------");
                         println!(
-                            "🔎 [分析] Tx: {} | 觸發 CP: {} -> 上鏈 CP: {} | 🐢 落後: {} 個 Checkpoints",
-                            tx_digest, trigger_checkpoint, tx_cp, lag
+                            "   ⏱️ Checkpoint Lag: {} (Trigger: {} -> On-Chain: {})", 
+                            lag, trigger_checkpoint, tx_cp
                         );
-                        // ✨ 修正 2：在這裡更新變數的值
+
+                        // === ✨✨✨ 移植的價格計算邏輯開始 ✨✨✨ ===
+                        
+                        // 1. 計算 Net Gas Fee
+                        let mut net_gas_fee: u64 = 0;
+                        if let Some(gas_summary) = json["result"]["effects"]["gasUsed"].as_object() {
+                            let comp = gas_summary.get("computationCost").and_then(|v| v.as_str()).unwrap_or("0").parse::<u64>().unwrap_or(0);
+                            let storage = gas_summary.get("storageCost").and_then(|v| v.as_str()).unwrap_or("0").parse::<u64>().unwrap_or(0);
+                            let rebate = gas_summary.get("storageRebate").and_then(|v| v.as_str()).unwrap_or("0").parse::<u64>().unwrap_or(0);
+                            
+                            let total_cost = comp + storage;
+                            if total_cost > rebate {
+                                net_gas_fee = total_cost - rebate;
+                            }
+                        }
+
+                        // 2. 解析 Balance Changes
+                        let mut swap_sui_in = 0.0;
+                        let mut swap_usdc_out = 0.0;
+
+                        if let Some(changes) = json["result"]["balanceChanges"].as_array() {
+                            for change in changes {
+                                let coin_type = change["coinType"].as_str().unwrap_or("");
+                                let amount_str = change["amount"].as_str().unwrap_or("0");
+                                
+                                if let Ok(amount_i128) = amount_str.parse::<i128>() {
+                                    if coin_type.contains("sui::SUI") {
+                                        // SUI 流出量 (Input + Gas)
+                                        if amount_i128 < 0 {
+                                            let total_out_abs = amount_i128.abs() as u64;
+                                            // 如果流出量大於 Gas，代表多出來的是拿去 Swap 的
+                                            if total_out_abs > net_gas_fee {
+                                                swap_sui_in = (total_out_abs - net_gas_fee) as f64 / 1_000_000_000.0;
+                                            }
+                                        }
+                                    } else if coin_type.contains("usdc::USDC") {
+                                        // USDC 流入量
+                                        if amount_i128 > 0 {
+                                            swap_usdc_out = (amount_i128 as f64) / 1_000_000.0;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // 3. 計算真實價格與滑點
+                        println!("   💰 gRPC 觸發價: {:.8}", trigger_price);
+                        
+                        if swap_sui_in > 0.0 {
+                            let real_price = swap_usdc_out / swap_sui_in;
+                            let diff_pct = ((real_price - trigger_price) / trigger_price) * 100.0;
+                            
+                            println!("   💵 實際成交價: {:.8} (Diff: {:.4}%)", real_price, diff_pct);
+                            println!("   📉 真實投入: {:.4} SUI (已扣除 Gas)", swap_sui_in);
+                            println!("   📈 實際獲得: {:.4} USDC", swap_usdc_out);
+
+                            price_diff_result = diff_pct;
+                        } else {
+                            println!("   ⚠️ 無法還原 Swap 成本 (可能 Gas 佔比過高或資料異常)");
+                        }
+                        println!("   -----------------------------------------\n");
+
                         lag_result = lag;
                     }
                 } else {
@@ -762,9 +905,30 @@ async fn check_lag_background(
         Err(e) => eprintln!("❌ [分析] 查詢 RPC 失敗: {}", e),
     }
 
-    // ✨ 修正 3：現在這裡讀得到 lag_result 了
     let _ = tx_sender.send(TradeStats {
         latency_ms,
         lag: lag_result,
+        price_diff: price_diff_result,
     }).await;
+}
+
+// ✨ 修正版：遞迴搜尋 current_sqrt_price，不再受限於層級結構
+fn extract_price_from_prost_struct(st: &prost_types::Struct) -> Option<String> {
+    // 1. 先檢查當前這一層有沒有我們要的 key
+    if let Some(val) = st.fields.get("current_sqrt_price") {
+        if let Some(prost_types::value::Kind::StringValue(s)) = &val.kind {
+            return Some(s.clone());
+        }
+    }
+
+    // 2. 如果沒有，就遍歷所有欄位，如果是物件(Struct)就鑽進去找
+    for (_, val) in &st.fields {
+        if let Some(prost_types::value::Kind::StructValue(inner_st)) = &val.kind {
+            if let Some(found) = extract_price_from_prost_struct(inner_st) {
+                return Some(found);
+            }
+        }
+    }
+    
+    None
 }
